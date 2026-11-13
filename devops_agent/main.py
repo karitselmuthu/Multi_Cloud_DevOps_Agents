@@ -23,6 +23,7 @@ class NewRequest(BaseModel):
     title: str
     description: str = ""
     cloud: str = "aws"
+    kind: str = "terraform"  # terraform | kubernetes
 
 
 @app.get("/healthz")
@@ -39,7 +40,9 @@ def ui():
 def create_request(r: NewRequest, bg: BackgroundTasks):
     if r.cloud not in ("aws", "azure"):
         raise HTTPException(422, "cloud must be aws or azure")
-    rid = db.create(r.title, r.description, r.cloud)
+    if r.kind not in ("terraform", "kubernetes"):
+        raise HTTPException(422, "kind must be terraform or kubernetes")
+    rid = db.create(r.title, r.description, r.cloud, r.kind)
     db.audit("user", "request.created", f"id={rid}")
     bg.add_task(agents.run_pipeline, rid)
     return {"id": rid}
@@ -65,9 +68,10 @@ def approve(rid: int):
     if req["status"] != "pending_approval":
         raise HTTPException(409, f"status is {req['status']}")
     db.audit("approver", "request.approved", f"id={rid}")
-    args = {"cloud": req["cloud"], "content": req["outputs"]["terraform"]}
+    tool, key = ("kubectl.apply", "kubernetes") if req["kind"] == "kubernetes" else ("terraform.apply", "terraform")
+    args = {"cloud": req["cloud"], "content": req["outputs"][key], "namespace": "apps"}
     try:
-        result = mcp.call("terraform.apply", args, approved=True, actor=f"request-{rid}")
+        result = mcp.call(tool, args, approved=True, actor=f"request-{rid}")
     except mcp.PolicyDenied as e:
         db.update(rid, status="failed", outputs={**req["outputs"], "error": str(e)})
         raise HTTPException(403, str(e))

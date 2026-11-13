@@ -38,6 +38,19 @@ class Tests(unittest.TestCase):
         self.assertEqual(c.post(f"/requests/{rid}/approve").status_code, 409)  # not re-appliable
         self.assertTrue(any(a["event"] == "mcp.call" for a in c.get("/audit").json()))
 
+    def test_kubernetes_flow_and_policy(self):
+        rid = c.post("/requests", json={"title": "Web app", "cloud": "aws", "kind": "kubernetes"}).json()["id"]
+        r = c.get(f"/requests/{rid}").json()
+        self.assertEqual(r["status"], "pending_approval")
+        self.assertIn("kind: Deployment", r["outputs"]["kubernetes"])
+        self.assertTrue(c.post(f"/requests/{rid}/approve").json()["dry_run"])
+        ok = {"cloud": "aws", "namespace": "apps", "content": "kind: Deployment\n"}
+        for bad in ({"namespace": "kube-system"}, {"content": "privileged: true"},
+                    {"content": "kind: ClusterRoleBinding"}, {"content": "metadata:\n  namespace: kube-system"}):
+            with self.assertRaises(mcp.PolicyDenied):
+                mcp.call("kubectl.apply", {**ok, **bad}, approved=True)
+        self.assertEqual(agents.scan("privileged: true")[0]["rule"], "k8s-privileged")
+
     def test_bad_cloud_and_auth(self):
         self.assertEqual(c.post("/requests", json={"title": "x", "cloud": "gcp"}).status_code, 422)
         os.environ["API_KEY"] = "k"

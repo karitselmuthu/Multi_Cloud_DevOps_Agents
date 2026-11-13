@@ -12,7 +12,7 @@ def _conn():
     c.row_factory = sqlite3.Row
     c.executescript(
         """CREATE TABLE IF NOT EXISTS requests(
-             id INTEGER PRIMARY KEY, title TEXT, description TEXT, cloud TEXT,
+             id INTEGER PRIMARY KEY, title TEXT, description TEXT, cloud TEXT, kind TEXT DEFAULT 'terraform',
              status TEXT, outputs TEXT DEFAULT '{}', created REAL);
            CREATE TABLE IF NOT EXISTS audit(
              id INTEGER PRIMARY KEY, ts REAL, actor TEXT, event TEXT, detail TEXT);"""
@@ -30,11 +30,11 @@ def _row(r):
     return d
 
 
-def create(title, description, cloud):
+def create(title, description, cloud, kind="terraform"):
     with _conn() as c:
         return c.execute(
-            "INSERT INTO requests(title,description,cloud,status,created) VALUES(?,?,?,?,?)",
-            (title, description, cloud, "queued", time.time()),
+            "INSERT INTO requests(title,description,cloud,kind,status,created) VALUES(?,?,?,?,?,?)",
+            (title, description, cloud, kind, "queued", time.time()),
         ).lastrowid
 
 
