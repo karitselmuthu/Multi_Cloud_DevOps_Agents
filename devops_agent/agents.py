@@ -1,10 +1,13 @@
 """Agent orchestration: Planning -> Infrastructure -> Code -> Security -> DevOps -> Monitoring.
 ponytail: a plain sequential runner instead of LangGraph/Temporal; each stage is state-in/text-out so
 porting to LangGraph nodes later is mechanical. Agents only *propose*; execution goes through mcp.py."""
+import base64
+import json
 import os
 import re
 
-from . import db, llm, mcp, rag
+from . import db, llm, mcp, policy, rag
+from .policy import scan  # noqa: F401 - re-exported: rules live in policy.py
 
 TF_TEMPLATE = {
     "aws": 'resource "aws_s3_bucket" "this" {\n  bucket = "{name}"\n}\n'
@@ -38,26 +41,8 @@ spec:
           livenessProbe: {httpGet: {path: /, port: 8080}}
 """
 
-# (rule id, regex, severity) -- blocking = high
-SECURITY_RULES = [
-    ("open-ingress", r'0\.0\.0\.0/0', "high"),
-    ("public-s3-acl", r'acl\s*=\s*"public', "high"),
-    ("iam-wildcard", r'"Action"\s*:\s*"\*"|actions\s*=\s*\["\*"\]', "high"),
-    ("hardcoded-secret", r'(?i)(password|secret|access_key)\s*=\s*"[^"$]{4,}"', "high"),
-    ("k8s-privileged", r'privileged:\s*true', "high"),
-    ("k8s-latest-tag", r'image:\s*\S+:latest\b', "medium"),
-    ("k8s-no-limits", r'kind:\s*Deployment(?![\s\S]*limits:)', "medium"),
-    ("k8s-run-as-root", r'runAsNonRoot:\s*false', "high"),
-    ("no-encryption", r'(?i)encrypted\s*=\s*false', "medium"),
-]
-
-
 def _slug(s):
     return re.sub(r"[^a-z0-9-]", "-", s.lower())[:40].strip("-") or "app"
-
-
-def scan(code):
-    return [{"rule": r, "severity": s} for r, rx, s in SECURITY_RULES if re.search(rx, code)]
 
 
 def _ask(stage, req, context):
@@ -68,7 +53,7 @@ def _ask(stage, req, context):
     )
 
 
-def run_pipeline(rid, raise_errors=False):
+def run_pipeline(rid, raise_errors=False, then_plan=True):
     req = db.get(rid)
     db.update(rid, status="running")
     out = {}
@@ -87,13 +72,15 @@ def run_pipeline(rid, raise_errors=False):
             out["terraform"] = m.group(1) if m else TF_TEMPLATE[req["cloud"]].replace("{name}", _slug(req["title"]))
             artifact = out["terraform"]
         out["code"] = _ask("code", req, f"Artifact:\n{artifact}")
-        out["findings"] = scan(artifact)
+        out["findings"] = scan(artifact, "kubernetes" if req["kind"] == "kubernetes" else "terraform")
         out["security"] = _ask("security", req, f"Findings: {out['findings']}")
         out["devops"] = _ask("devops", req, "Describe the CI/CD steps to deploy this.")
         out["monitoring"] = _ask("monitoring", req, "Propose alerts and dashboards.")
         blocked = any(f["severity"] == "high" for f in out["findings"])
-        db.update(rid, status="blocked" if blocked else "pending_approval", outputs=out)
-        db.audit("agents", "pipeline.done", f"request={rid} blocked={blocked}")
+        db.update(rid, status="blocked" if blocked else "planning", outputs=out)
+        db.audit("agents", "pipeline.done", f"request={rid} blocked={blocked}", request_id=rid)
+        if not blocked and then_plan:  # Temporal mode runs the plan step on the executor instead
+            plan_request(rid)
     except Exception as e:  # noqa: BLE001 - surface any stage failure on the request
         out["error"] = str(e)
         db.update(rid, status="failed", outputs=out)
@@ -106,16 +93,40 @@ class Conflict(Exception):
     """Request is not in a state that can be applied (already applied, rejected, expired...)."""
 
 
-def apply_request(rid):
-    """Approved execution, shared by the HTTP path and the Temporal activity. Raises Conflict / mcp.PolicyDenied."""
+def _artifact(req):
+    return ("kubernetes", "kubectl.apply") if req["kind"] == "kubernetes" else ("terraform", "github.create_pr" if req["kind"] == "github" else "terraform.apply")
+
+
+def plan_request(rid):
+    """Produce the exact thing a human will approve: the artifact plus (terraform) a saved plan file. Stores its hash."""
+    req = db.get(rid)
+    key, _ = _artifact(req)
+    content = req["outputs"][key]
+    blob_b64, summ = "", policy.summary(content, key)
+    if req["kind"] == "terraform":
+        try:
+            res = mcp.call("terraform.plan", {"cloud": req["cloud"], "content": content, "request_id": rid}, actor=f"request-{rid}")
+        except mcp.PolicyDenied as e:
+            res = {"error": str(e)}
+        if "error" in res:
+            db.update(rid, status="failed", outputs={**req["outputs"], "error": res["error"]})
+            return
+        blob_b64, summ = res.get("plan_blob", ""), res.get("summary") or summ
+    ph = policy.plan_hash(content, base64.b64decode(blob_b64))
+    db.set_plan(rid, ph, blob_b64, json.dumps(summ))
+    db.update(rid, status="pending_approval", outputs={**req["outputs"], "plan_summary": summ, "plan_hash": ph})
+    db.audit("agents", "plan.ready", f"request={rid}", request_id=rid, plan_hash=ph)
+
+
+def apply_request(rid, token):
+    """Approved execution, shared by the HTTP path and the Temporal activity. Raises Conflict / mcp.PolicyDenied.
+    The gateway verifies the token against the plan hash it recomputes from what it is about to run."""
     req = db.get(rid)
     if not db.claim(rid, "pending_approval", "applying"):  # atomic: concurrent approvals can't both run
         raise Conflict(f"status is {req['status'] if req else 'missing'}")
-    db.audit("approver", "request.approved", f"id={rid}")
-    tool, key = {"kubernetes": ("kubectl.apply", "kubernetes"), "github": ("github.create_pr", "terraform")}.get(
-        req["kind"], ("terraform.apply", "terraform")
-    )
-    args = {"cloud": req["cloud"], "content": req["outputs"][key], "namespace": "apps"}
+    key, tool = _artifact(req)
+    plan = db.get_plan(rid) or {"blob": ""}
+    args = {"cloud": req["cloud"], "content": req["outputs"][key], "namespace": "apps", "request_id": rid, "plan_blob": plan["blob"]}
     if tool == "github.create_pr":  # deliver as a PR to the GitOps repo instead of applying directly
         args |= {
             "repo": os.getenv("GITHUB_REPO", ""), "path": f"requests/{rid}-{_slug(req['title'])}/main.tf",
@@ -123,9 +134,13 @@ def apply_request(rid):
             "body": f"Generated by DevOps agents for request #{rid}. Security findings: {req['outputs'].get('findings')}",
         }
     try:
-        result = mcp.call(tool, args, approved=True, actor=f"request-{rid}")
+        result = mcp.call(tool, args, token=token, actor=f"request-{rid}")
+    except mcp.ApprovalRejected:
+        db.claim(rid, "applying", "pending_approval")  # plan or token problem: a human must approve again
+        raise
     except mcp.PolicyDenied as e:
         db.update(rid, status="failed", outputs={**req["outputs"], "error": str(e)})
         raise
-    db.update(rid, status="pr_opened" if tool == "github.create_pr" else "applied", outputs={**req["outputs"], "apply": result})
+    status = "failed" if result.get("error") or result.get("rc") else "pr_opened" if tool == "github.create_pr" else "applied"
+    db.update(rid, status=status, outputs={**req["outputs"], "apply": result})
     return result

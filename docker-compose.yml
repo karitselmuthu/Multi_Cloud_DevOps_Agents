@@ -1,8 +1,11 @@
-# Local full stack: app + worker + Postgres + Temporal dev server.  docker compose up --build
+# Local full stack: api + agents worker + executor worker + Postgres + Temporal dev server.  docker compose up --build
 # Temporal UI: http://localhost:8233   App: http://localhost:8000
-x-env: &env
-  DATABASE_URL: postgresql://agents:agents@db:5432/agents
-  TEMPORAL_ADDRESS: temporal:7233
+# Dev-only credentials below. Users: alice (requester), bob (approver), carol (both; cannot approve her own requests).
+# Secret separation mirrors prod: ONLY api + executor have APPROVAL_SECRET; ONLY agents gets LLM keys; executor runs real
+# terraform only when EXECUTE=1 (off by default) and needs TF_STATE_BUCKET + AWS credentials you provide.
+x-common: &common
+  build: .
+  depends_on: {db: {condition: service_healthy}, temporal: {condition: service_started}}
 services:
   db:
     image: postgres:16
@@ -12,13 +15,34 @@ services:
     image: temporalio/temporal:latest
     command: server start-dev --ip 0.0.0.0
     ports: ["7233:7233", "8233:8233"]
-  app:
-    build: .
+  api:
+    <<: *common
     ports: ["8000:8000"]
-    environment: *env
-    depends_on: {db: {condition: service_healthy}, temporal: {condition: service_started}}
-  worker:
-    build: .
-    command: python -m devops_agent.worker
-    environment: *env
-    depends_on: {db: {condition: service_healthy}, temporal: {condition: service_started}}
+    environment:
+      DATABASE_URL: postgresql://agents:agents@db:5432/agents
+      TEMPORAL_ADDRESS: temporal:7233
+      APPROVAL_SECRET: dev-only-approval-secret-change-me
+      API_USERS: '{"dev-alice":{"user":"alice","roles":["requester"]},"dev-bob":{"user":"bob","roles":["approver"]},"dev-carol":{"user":"carol","roles":["requester","approver"]}}'
+  agents:
+    <<: *common
+    command: python -m devops_agent.worker agents
+    environment:
+      DATABASE_URL: postgresql://agents:agents@db:5432/agents
+      TEMPORAL_ADDRESS: temporal:7233
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  executor:
+    <<: *common
+    command: python -m devops_agent.worker executor
+    environment:
+      DATABASE_URL: postgresql://agents:agents@db:5432/agents
+      TEMPORAL_ADDRESS: temporal:7233
+      APPROVAL_SECRET: dev-only-approval-secret-change-me
+      EXECUTE: ${EXECUTE:-0}
+      TF_STATE_BUCKET: ${TF_STATE_BUCKET:-}
+      GITHUB_REPO: ${GITHUB_REPO:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}

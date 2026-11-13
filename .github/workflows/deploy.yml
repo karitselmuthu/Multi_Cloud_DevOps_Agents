@@ -1,6 +1,7 @@
 # Build -> push -> terraform apply, triggered MANUALLY (Actions -> deploy -> Run workflow). Needs (repo Settings -> Variables):
 #   DEPLOYER_ROLE_ARN  (an IAM role trusting GitHub OIDC for this repo)
-#   STATE_BUCKET       (S3 bucket for terraform state)
+#   STATE_BUCKET       (S3 bucket for terraform state; also the executor's state bucket)
+#   secret API_USERS   (JSON of users and roles, see README); optional vars TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, EXECUTE ("true")
 #   ALLOWED_CIDR       (network allowed to reach the ALB, e.g. 203.0.113.7/32)
 # Protect the `production` environment with required reviewers so a human approves each deploy.
 name: deploy
@@ -41,10 +42,14 @@ jobs:
           docker push "$IMAGE"
       - name: Terraform apply
         working-directory: infrastructure/terraform/aws
+        env:
+          TF_VAR_api_users: ${{ secrets.API_USERS }}   # JSON: passed via env, not -var, so quotes survive the shell
         run: |
           terraform init -input=false -backend-config="bucket=${{ vars.STATE_BUCKET }}" -backend-config="key=devops-agent/terraform.tfstate" -backend-config="region=us-east-1"
           terraform apply -input=false -auto-approve \
-            -var "image_tag=${GITHUB_SHA::12}" -var "allowed_cidr=${{ vars.ALLOWED_CIDR }}"
+            -var "image_tag=${GITHUB_SHA::12}" -var "allowed_cidr=${{ vars.ALLOWED_CIDR }}" \
+            -var "state_bucket=${{ vars.STATE_BUCKET }}" \
+            -var "temporal_address=${{ vars.TEMPORAL_ADDRESS }}" -var "execute=${{ vars.EXECUTE || 'false' }}"
       - name: Smoke test
         run: |
           ALB=$(terraform -chdir=infrastructure/terraform/aws output -raw alb_dns_name)

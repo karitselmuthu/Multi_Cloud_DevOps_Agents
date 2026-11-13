@@ -19,3 +19,6 @@ jobs:
           terraform -chdir=infrastructure/terraform/aws fmt -check
           terraform -chdir=infrastructure/terraform/aws init -backend=false -input=false
           terraform -chdir=infrastructure/terraform/aws validate
+          terraform -chdir=infrastructure/terraform/aws-state fmt -check
+          terraform -chdir=infrastructure/terraform/aws-state init -backend=false -input=false
+          terraform -chdir=infrastructure/terraform/aws-state validate
