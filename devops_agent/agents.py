@@ -3,7 +3,7 @@ ponytail: a plain sequential runner instead of LangGraph/Temporal; each stage is
 porting to LangGraph nodes later is mechanical. Agents only *propose*; execution goes through mcp.py."""
 import re
 
-from . import db, llm, rag
+from . import db, llm, mcp, rag
 
 TF_TEMPLATE = {
     "aws": 'resource "aws_s3_bucket" "this" {\n  bucket = "{name}"\n}\n'
@@ -66,7 +66,7 @@ def _ask(stage, req, context):
     )
 
 
-def run_pipeline(rid):
+def run_pipeline(rid, raise_errors=False):
     req = db.get(rid)
     db.update(rid, status="running")
     out = {}
@@ -96,3 +96,26 @@ def run_pipeline(rid):
         out["error"] = str(e)
         db.update(rid, status="failed", outputs=out)
         db.audit("agents", "pipeline.failed", f"request={rid}: {e}")
+        if raise_errors:  # Temporal retries the activity; plain mode just records the failure
+            raise
+
+
+class Conflict(Exception):
+    """Request is not in a state that can be applied (already applied, rejected, expired...)."""
+
+
+def apply_request(rid):
+    """Approved execution, shared by the HTTP path and the Temporal activity. Raises Conflict / mcp.PolicyDenied."""
+    req = db.get(rid)
+    if not db.claim(rid, "pending_approval", "applying"):  # atomic: concurrent approvals can't both run
+        raise Conflict(f"status is {req['status'] if req else 'missing'}")
+    db.audit("approver", "request.approved", f"id={rid}")
+    tool, key = ("kubectl.apply", "kubernetes") if req["kind"] == "kubernetes" else ("terraform.apply", "terraform")
+    args = {"cloud": req["cloud"], "content": req["outputs"][key], "namespace": "apps"}
+    try:
+        result = mcp.call(tool, args, approved=True, actor=f"request-{rid}")
+    except mcp.PolicyDenied as e:
+        db.update(rid, status="failed", outputs={**req["outputs"], "error": str(e)})
+        raise
+    db.update(rid, status="applied", outputs={**req["outputs"], "apply": result})
+    return result
