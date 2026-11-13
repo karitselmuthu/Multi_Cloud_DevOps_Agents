@@ -1,0 +1,51 @@
+# Build -> push -> terraform apply, triggered MANUALLY (Actions -> deploy -> Run workflow). Needs (repo Settings -> Variables):
+#   DEPLOYER_ROLE_ARN  (an IAM role trusting GitHub OIDC for this repo)
+#   STATE_BUCKET       (S3 bucket for terraform state)
+#   ALLOWED_CIDR       (network allowed to reach the ALB, e.g. 203.0.113.7/32)
+# Protect the `production` environment with required reviewers so a human approves each deploy.
+name: deploy
+on:
+  workflow_dispatch:   # manual only: the platform is torn down daily (scripts/down.sh), so a push must not recreate it
+concurrency: deploy
+permissions:
+  id-token: write   # OIDC: no long-lived AWS keys
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04-arm   # native arm64: matches the Fargate task runtime
+    environment: production
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt && python -m unittest discover -s . -t . -p "test_*.py"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEPLOYER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with: {terraform_version: "1.15.6"}
+      - name: Ensure ECR repo exists
+        working-directory: infrastructure/terraform/aws
+        run: |
+          terraform init -input=false -backend-config="bucket=${{ vars.STATE_BUCKET }}" -backend-config="key=devops-agent/terraform.tfstate" -backend-config="region=us-east-1"
+          terraform apply -input=false -auto-approve -target=aws_ecr_repository.app -var "allowed_cidr=${{ vars.ALLOWED_CIDR }}"
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push (immutable tag = commit)
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/devops-agent:${GITHUB_SHA::12}
+          docker build --platform linux/arm64 -t "$IMAGE" .
+          docker push "$IMAGE"
+      - name: Terraform apply
+        working-directory: infrastructure/terraform/aws
+        run: |
+          terraform init -input=false -backend-config="bucket=${{ vars.STATE_BUCKET }}" -backend-config="key=devops-agent/terraform.tfstate" -backend-config="region=us-east-1"
+          terraform apply -input=false -auto-approve \
+            -var "image_tag=${GITHUB_SHA::12}" -var "allowed_cidr=${{ vars.ALLOWED_CIDR }}"
+      - name: Smoke test
+        run: |
+          ALB=$(terraform -chdir=infrastructure/terraform/aws output -raw alb_dns_name)
+          for i in $(seq 1 30); do curl -fsS "http://$ALB/healthz" && exit 0 || sleep 10; done; exit 1

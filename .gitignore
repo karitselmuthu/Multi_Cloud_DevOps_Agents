@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+devops.db
+.terraform/
+*.tfstate*
+*.tfvars
+crash.log
+.env
+backend.hcl
+.DS_Store

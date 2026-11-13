@@ -1,0 +1,21 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s . -t . -p "test_*.py"
+      - uses: hashicorp/setup-terraform@v3
+        with: {terraform_version: "1.15.6"}
+      - name: terraform fmt + validate
+        run: |
+          terraform -chdir=infrastructure/terraform/aws fmt -check
+          terraform -chdir=infrastructure/terraform/aws init -backend=false -input=false
+          terraform -chdir=infrastructure/terraform/aws validate
