@@ -7,14 +7,14 @@ input,select,textarea,button{font:inherit;padding:.4rem;margin:.2rem 0}
 input,textarea{width:100%;box-sizing:border-box}
 table{width:100%;border-collapse:collapse;margin-top:1rem}td,th{border-bottom:1px solid #ddd;padding:.4rem;text-align:left}
 pre{background:#f5f5f5;padding:.6rem;overflow:auto;max-height:18rem}
-.s{padding:.1rem .5rem;border-radius:1rem;background:#eee}.pending_approval{background:#ffe9a8}.applied{background:#c8f0c8}.blocked,.failed{background:#f8c8c8}
+.s{padding:.1rem .5rem;border-radius:1rem;background:#eee}.pending_approval{background:#ffe9a8}.applied,.pr_opened{background:#c8f0c8}.blocked,.failed{background:#f8c8c8}
 </style></head><body>
 <h1>Multi-Cloud DevOps Agents</h1>
 <input id="key" type="password" placeholder="API key (if configured)">
 <input id="title" placeholder="Title, e.g. Private S3 bucket for logs">
 <textarea id="desc" rows="3" placeholder="What do you need?"></textarea>
 <select id="cloud"><option>aws</option><option>azure</option></select>
-<select id="kind"><option>terraform</option><option>kubernetes</option></select>
+<select id="kind"><option>terraform</option><option>kubernetes</option><option>github</option></select>
 <button onclick="submitReq()">Submit request</button>
 <table><thead><tr><th>#</th><th>Title</th><th>Cloud</th><th>Status</th><th></th></tr></thead><tbody id="rows"></tbody></table>
 <pre id="detail">Select a request to see agent output.</pre>

@@ -3,15 +3,27 @@ import asyncio
 import os
 import pathlib
 import secrets
+import time
 from collections import Counter
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import agents, db, mcp, workflows
+from . import agents, db, mcp, obs, workflows
 
 app = FastAPI(title="Multi-Cloud DevOps Agents")
+
+
+@app.middleware("http")
+async def access_log(request, call_next):
+    t0 = time.time()
+    resp = await call_next(request)
+    route = getattr(request.scope.get("route"), "path", "unmatched")  # template, not raw path: bounded label cardinality
+    obs.inc("http_requests_total", route=route, method=request.method, status=resp.status_code)
+    if route != "/healthz":
+        obs.log("http", route=route, method=request.method, status=resp.status_code, ms=int((time.time() - t0) * 1000))
+    return resp
 
 
 def auth(x_api_key: str = Header(default="")):
@@ -24,7 +36,7 @@ class NewRequest(BaseModel):
     title: str
     description: str = ""
     cloud: str = "aws"
-    kind: str = "terraform"  # terraform | kubernetes
+    kind: str = "terraform"  # terraform | kubernetes | github (PR to GITHUB_REPO)
 
 
 @app.get("/healthz")
@@ -54,8 +66,8 @@ async def _temporal():
 async def create_request(r: NewRequest, bg: BackgroundTasks):
     if r.cloud not in ("aws", "azure"):
         raise HTTPException(422, "cloud must be aws or azure")
-    if r.kind not in ("terraform", "kubernetes"):
-        raise HTTPException(422, "kind must be terraform or kubernetes")
+    if r.kind not in ("terraform", "kubernetes", "github"):
+        raise HTTPException(422, "kind must be terraform, kubernetes or github")
     rid = await asyncio.to_thread(db.create, r.title, r.description, r.cloud, r.kind)
     db.audit("user", "request.created", f"id={rid}")
     if tc := await _temporal():
@@ -117,4 +129,4 @@ def audit():
 @app.get("/metrics", response_class=PlainTextResponse)
 def metrics():
     c = Counter(r["status"] for r in db.list_all())
-    return "\n".join(f'devops_requests{{status="{s}"}} {n}' for s, n in c.items()) + "\n"
+    return "".join(f'devops_requests{{status="{s}"}} {n}\n' for s, n in c.items()) + obs.render()
