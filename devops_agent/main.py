@@ -65,7 +65,7 @@ def _404():
 @app.post("/requests/{rid}/approve", dependencies=[Depends(auth)])
 def approve(rid: int):
     req = db.get(rid) or _404()
-    if req["status"] != "pending_approval":
+    if not db.claim(rid, "pending_approval", "applying"):  # atomic: concurrent approvals can't both run
         raise HTTPException(409, f"status is {req['status']}")
     db.audit("approver", "request.approved", f"id={rid}")
     tool, key = ("kubectl.apply", "kubernetes") if req["kind"] == "kubernetes" else ("terraform.apply", "terraform")

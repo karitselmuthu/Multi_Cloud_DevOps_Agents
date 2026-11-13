@@ -1,7 +1,8 @@
 terraform {
   required_version = ">= 1.5"
   required_providers {
-    aws = { source = "hashicorp/aws", version = "~> 5.0" }
+    aws    = { source = "hashicorp/aws", version = "~> 5.0" }
+    random = { source = "hashicorp/random", version = "~> 3.6" }
   }
   backend "s3" {} # supply with: terraform init -backend-config=backend.hcl (see backend.hcl.example)
 }
@@ -128,6 +129,69 @@ resource "aws_security_group" "task" {
   tags = local.tags
 }
 
+# --- Postgres (RDS). Daily teardown: no final snapshot, no deletion protection. State is disposable by design. ---
+resource "random_password" "db" {
+  length  = 32
+  special = false # keeps the connection URL free of characters that need escaping
+}
+
+resource "aws_security_group" "db" {
+  name   = "${local.name}-db"
+  vpc_id = data.aws_vpc.default.id
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.task.id]
+  }
+  tags = local.tags
+}
+
+resource "aws_db_subnet_group" "this" {
+  name       = local.name
+  subnet_ids = data.aws_subnets.default.ids
+  tags       = local.tags
+}
+
+resource "aws_db_instance" "this" {
+  identifier              = local.name
+  engine                  = "postgres"
+  engine_version          = "16"
+  instance_class          = "db.t4g.micro"
+  allocated_storage       = 20
+  storage_type            = "gp3"
+  storage_encrypted       = true
+  db_name                 = "agents"
+  username                = "agents"
+  password                = random_password.db.result
+  db_subnet_group_name    = aws_db_subnet_group.this.name
+  vpc_security_group_ids  = [aws_security_group.db.id]
+  publicly_accessible     = false
+  skip_final_snapshot     = true
+  deletion_protection     = false
+  backup_retention_period = 0
+  tags                    = local.tags
+}
+
+resource "aws_secretsmanager_secret" "db_url" {
+  name                    = "${local.name}/database-url"
+  recovery_window_in_days = 0 # delete immediately so the daily rebuild can reuse the name
+  tags                    = local.tags
+}
+
+resource "aws_secretsmanager_secret_version" "db_url" {
+  secret_id     = aws_secretsmanager_secret.db_url.id
+  secret_string = "postgresql://agents:${random_password.db.result}@${aws_db_instance.this.address}:5432/agents?sslmode=require"
+}
+
+resource "aws_iam_role_policy" "exec_secret" {
+  role = aws_iam_role.exec.id
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = "secretsmanager:GetSecretValue", Resource = aws_secretsmanager_secret.db_url.arn }]
+  })
+}
+
 resource "aws_lb" "this" {
   name               = local.name
   load_balancer_type = "application"
@@ -174,8 +238,8 @@ resource "aws_ecs_task_definition" "app" {
     portMappings = [{ containerPort = 8000 }]
     environment = [
       { name = "API_KEY", value = var.api_key },
-      { name = "DB_PATH", value = "/tmp/devops.db" }, # ephemeral by design: platform is rebuilt daily
     ]
+    secrets = [{ name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.db_url.arn }]
     logConfiguration = {
       logDriver = "awslogs"
       options   = { awslogs-group = aws_cloudwatch_log_group.app.name, awslogs-region = var.region, awslogs-stream-prefix = "app" }
@@ -200,7 +264,7 @@ resource "aws_ecs_service" "app" {
     container_name   = "app"
     container_port   = 8000
   }
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.http, aws_secretsmanager_secret_version.db_url, aws_iam_role_policy.exec_secret]
   tags       = local.tags
 }
 
